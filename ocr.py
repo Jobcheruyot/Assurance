@@ -1,161 +1,95 @@
-# ======================================================
-# STREAMLIT MULTI-SUPPLIER INVOICE OCR SYSTEM (FOLDER)
-# ======================================================
-
 import streamlit as st
 import os
-import pandas as pd
+import tempfile
 import pytesseract
-import pdfplumber
 from pdf2image import convert_from_path
-import camelot
-import re
-import zipfile
-from io import BytesIO
+import pdfplumber
+import pandas as pd
+from PIL import Image
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Invoice OCR Folder Processor", layout="wide")
-st.title("📁 Multi-Supplier Invoice OCR – Folder Upload Version")
+# ============ STREAMLIT UI ============ #
+st.set_page_config(page_title="Invoice OCR Extractor", layout="wide")
+st.title("🧾 Multi-PDF Invoice OCR Extractor")
+st.markdown("Upload a **folder (or multiple PDFs)**. The app will scan all subfolders for PDFs, extract text and items, and export results to Excel.")
 
-# --- Column Name Library ---
-column_library = {
-    "invoice_no": ["invoice no", "inv no", "invoice number", "inv#", "bill no"],
-    "date": ["date", "invoice date", "bill date"],
-    "supplier": ["supplier", "vendor", "company"],
-    "item": ["item", "description", "product", "goods"],
-    "qty": ["qty", "quantity", "pcs", "no.", "units"],
-    "price": ["price", "unit price", "unit cost", "rate", "cost"],
-    "total": ["total", "amount", "value", "line total"],
-    "vat": ["vat", "tax", "vat amount"]
-}
-
-def normalize_columns(df, column_library):
-    rename_map = {}
-    for std_col, variants in column_library.items():
-        for col in df.columns:
-            col_clean = col.lower().strip()
-            if any(col_clean.startswith(v.lower()) for v in variants):
-                rename_map[col] = std_col
-    df = df.rename(columns=rename_map)
-    return df
-
-
-# --- Extract Data from PDF ---
-def extract_invoice_data(pdf_path, supplier="Unknown"):
-    all_rows = []
-
-    # Try Camelot
-    try:
-        tables = camelot.read_pdf(pdf_path, pages='all')
-        if tables:
-            for t in tables:
-                df = t.df
-                df.columns = df.iloc[0]
-                df = df.drop(0)
-                df = normalize_columns(df, column_library)
-                df["supplier"] = supplier
-                all_rows.append(df)
-    except Exception as e:
-        print("Camelot error:", e)
-
-    # Try pdfplumber
-    if not all_rows:
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
-                    table = page.extract_table()
-                    if table:
-                        df = pd.DataFrame(table[1:], columns=table[0])
-                        df = normalize_columns(df, column_library)
-                        df["supplier"] = supplier
-                        all_rows.append(df)
-        except Exception as e:
-            print("pdfplumber error:", e)
-
-    # Try OCR fallback
-    if not all_rows:
-        try:
-            images = convert_from_path(pdf_path)
-            text = ""
-            for img in images:
-                text += pytesseract.image_to_string(img)
-            items = re.findall(r"([A-Za-z].+?)\s+(\d+)\s+([\d.,]+)\s+([\d.,]+)", text)
-            if items:
-                df = pd.DataFrame(items, columns=["item", "qty", "price", "total"])
-                df["supplier"] = supplier
-                all_rows.append(df)
-        except Exception as e:
-            print("OCR error:", e)
-
-    if all_rows:
-        return pd.concat(all_rows, ignore_index=True)
-    else:
-        return pd.DataFrame()
-
-
-# --- ZIP Folder Upload ---
-uploaded_zip = st.file_uploader(
-    "📦 Upload Folder (ZIP file) containing all Supplier Invoices (Subfolders allowed)",
-    type=["zip"]
+# ============ FILE UPLOAD ============ #
+uploaded_files = st.file_uploader(
+    "📂 Upload all your PDF files (drag & drop from a folder)",
+    type=["pdf"],
+    accept_multiple_files=True
 )
 
-if uploaded_zip:
-    st.info("Unzipping and scanning for PDF files...")
+if uploaded_files:
+    # Create a temporary folder to store uploaded PDFs
+    temp_dir = tempfile.mkdtemp()
+    pdf_paths = []
 
-    # Create temp directory
-    temp_dir = "uploaded_invoices"
-    if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir)
+    # Save all uploaded PDFs to temp directory
+    for uploaded_file in uploaded_files:
+        file_path = os.path.join(temp_dir, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.read())
+        pdf_paths.append(file_path)
 
-    # Save ZIP locally
-    zip_path = os.path.join(temp_dir, "invoices.zip")
-    with open(zip_path, "wb") as f:
-        f.write(uploaded_zip.read())
+    st.success(f"✅ {len(pdf_paths)} PDF file(s) uploaded successfully!")
 
-    # Extract
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(temp_dir)
+    # ============ PROCESSING ============ #
+    progress = st.progress(0)
+    extracted_data = []
 
-    # Find all PDFs (including subfolders)
-    pdf_files = []
-    for root, _, files in os.walk(temp_dir):
-        for file in files:
-            if file.lower().endswith(".pdf"):
-                pdf_files.append(os.path.join(root, file))
+    for idx, pdf_file in enumerate(pdf_paths):
+        st.write(f"🔍 Processing: {os.path.basename(pdf_file)}")
+        try:
+            # Extract text using pdfplumber first (structured text)
+            with pdfplumber.open(pdf_file) as pdf:
+                all_text = ""
+                for page in pdf.pages:
+                    all_text += page.extract_text() or ""
 
-    st.write(f"🔍 Found {len(pdf_files)} PDF(s) inside the uploaded folder.")
+            # If pdfplumber fails or text is empty, fallback to OCR
+            if not all_text.strip():
+                st.warning(f"No extractable text in {os.path.basename(pdf_file)} — switching to OCR...")
+                images = convert_from_path(pdf_file)
+                for image in images:
+                    text = pytesseract.image_to_string(image)
+                    all_text += text
 
-    # Process each PDF
-    if pdf_files:
-        all_data = []
-        for path in pdf_files:
-            supplier_guess = os.path.basename(path).split("_")[0]
-            st.write(f"📄 Processing: {os.path.basename(path)}")
-            df = extract_invoice_data(path, supplier_guess)
-            if not df.empty:
-                df["file_name"] = os.path.basename(path)
-                all_data.append(df)
-            else:
-                st.warning(f"No data extracted from {os.path.basename(path)}")
+            # Simple line splitting logic
+            lines = [line.strip() for line in all_text.split("\n") if line.strip()]
 
-        # Combine results
-        if all_data:
-            final_df = pd.concat(all_data, ignore_index=True)
-            st.success("✅ All Invoices Processed Successfully!")
-            st.dataframe(final_df, use_container_width=True)
+            # Try to extract item-like lines
+            for line in lines:
+                if any(char.isdigit() for char in line):  # crude way to find item lines
+                    extracted_data.append({
+                        "File": os.path.basename(pdf_file),
+                        "Line": line
+                    })
 
-            # Download as Excel
-            output = BytesIO()
-            final_df.to_excel(output, index=False)
+        except Exception as e:
+            st.error(f"Error processing {os.path.basename(pdf_file)}: {e}")
+
+        progress.progress((idx + 1) / len(pdf_paths))
+
+    # ============ EXPORT RESULTS ============ #
+    if extracted_data:
+        df = pd.DataFrame(extracted_data)
+        st.subheader("📊 Extracted Invoice Data")
+        st.dataframe(df.head(50))
+
+        # Export to Excel
+        output_path = os.path.join(temp_dir, "Extracted_Invoices.xlsx")
+        df.to_excel(output_path, index=False)
+
+        with open(output_path, "rb") as f:
             st.download_button(
-                label="📥 Download Extracted Data (Excel)",
-                data=output.getvalue(),
-                file_name="Extracted_Invoices_Data.xlsx",
+                label="⬇️ Download Extracted Excel File",
+                data=f,
+                file_name="Extracted_Invoices.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.error("No extractable data found in the uploaded PDFs.")
+
+        st.success("✅ Extraction Complete! Download your Excel file above.")
     else:
-        st.error("No PDF files detected in uploaded folder.")
+        st.warning("⚠️ No valid data found in uploaded PDFs.")
 else:
-    st.info("Upload a ZIP folder containing all supplier invoices (PDFs).")
+    st.info("👆 Upload PDF files from your folders to begin.")
